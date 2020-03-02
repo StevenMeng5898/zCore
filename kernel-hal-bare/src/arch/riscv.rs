@@ -1,6 +1,7 @@
 use super::*;
 use riscv::paging::{*, PageTableFlags as PTF};
 use riscv::addr::Page;
+use riscv::register::satp;
 
 /// Page Table
 #[repr(C)]
@@ -17,7 +18,8 @@ impl PageTableImpl {
         let root_vaddr = phys_to_virt(root_frame.paddr);
         let root = unsafe { &mut *(root_vaddr as *mut PageTable) };
         root.zero();
-        map_kernel(root_vaddr as _);
+        let current = phys_to_virt(satp::read().frame().start_address().as_usize()) as *const PageTable;
+        map_kernel(root_vaddr as _, current as _);
         trace!("create page table @ {:#x}", root_frame.paddr);
         PageTableImpl { root_paddr: root_frame.paddr }
     }
@@ -88,6 +90,14 @@ impl PageTableImpl {
     }
 }
 
+pub unsafe fn set_page_table(vmtoken: usize) {
+    #[cfg(target_arch = "riscv32")]
+    let mode = satp::Mode::Sv32;
+    #[cfg(target_arch = "riscv64")]
+    let mode = satp::Mode::Sv39;
+    satp::set(mode, 0, vmtoken >> 12);
+}
+
 trait FlagsExt {
     fn to_ptf(self) -> PTF;
 }
@@ -103,6 +113,9 @@ impl FlagsExt for MMUFlags {
         }
         if self.contains(MMUFlags::EXECUTE) {
             flags |= PTF::EXECUTABLE;
+        }
+        if self.contains(MMUFlags::USER) {
+            flags |= PTF::USER;
         }
         flags
     }
@@ -127,3 +140,5 @@ impl FrameDeallocator for FrameAllocatorImpl {
         .dealloc()
     }
 }
+
+pub fn init() {}

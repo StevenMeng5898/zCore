@@ -15,8 +15,12 @@ pub type VirtAddr = usize;
 /// Size of a page
 pub const PAGE_SIZE: usize = 0x1000;
 
-fn page_aligned(x: usize) -> bool {
+pub fn page_aligned(x: usize) -> bool {
     x % PAGE_SIZE == 0
+}
+
+pub fn check_aligned(x: usize, align: usize) -> bool {
+    x % align == 0
 }
 
 /// How many pages the `size` needs.

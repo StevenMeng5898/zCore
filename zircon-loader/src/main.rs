@@ -17,6 +17,9 @@ struct Opt {
     #[structopt(parse(from_os_str))]
     zbi_path: PathBuf,
 
+    #[structopt(parse(from_os_str))]
+    decompressor_path: PathBuf,
+
     #[structopt(default_value = "")]
     cmdline: String,
 }
@@ -30,9 +33,15 @@ async fn main() {
     let userboot_data = std::fs::read(opt.userboot_path).expect("failed to read file");
     let vdso_data = std::fs::read(opt.vdso_path).expect("failed to read file");
     let zbi_data = std::fs::read(opt.zbi_path).expect("failed to read file");
+    let decompressor_data = std::fs::read(opt.decompressor_path).expect("failed to read file");
 
-    let proc: Arc<dyn KernelObject> =
-        run_userboot(&userboot_data, &vdso_data, &zbi_data, &opt.cmdline);
+    let proc: Arc<dyn KernelObject> = run_userboot(
+        &userboot_data,
+        &vdso_data,
+        &decompressor_data,
+        &zbi_data,
+        &opt.cmdline,
+    );
     proc.wait_signal_async(Signal::PROCESS_TERMINATED).await;
 }
 
@@ -46,17 +55,24 @@ mod tests {
 
         let base = PathBuf::from("../prebuilt");
         let opt = Opt {
+            decompressor_path: base.join("zircon/decompress-zstd.so"),
             userboot_path: base.join("userboot.so"),
             vdso_path: base.join("libzircon.so"),
-            zbi_path: base.join("legacy-image-x64.zbi"),
+            zbi_path: base.join("zircon/fuchsia.zbi"),
             cmdline: String::from(""),
         };
         let userboot_data = std::fs::read(opt.userboot_path).expect("failed to read file");
         let vdso_data = std::fs::read(opt.vdso_path).expect("failed to read file");
         let zbi_data = std::fs::read(opt.zbi_path).expect("failed to read file");
+        let decompressor_data = std::fs::read(opt.decompressor_path).expect("failed to read file");
 
-        let proc: Arc<dyn KernelObject> =
-            run_userboot(&userboot_data, &vdso_data, &zbi_data, &opt.cmdline);
+        let proc: Arc<dyn KernelObject> = run_userboot(
+            &userboot_data,
+            &vdso_data,
+            &decompressor_data,
+            &zbi_data,
+            &opt.cmdline,
+        );
         proc.wait_signal_async(Signal::PROCESS_TERMINATED).await;
     }
 }

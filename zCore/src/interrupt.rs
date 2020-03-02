@@ -1,19 +1,12 @@
 #![allow(dead_code)]
 #![allow(non_upper_case_globals)]
-use {
-    super::process::processor,
-    kernel_hal_bare::arch::ack,
-    trapframe::{init as init_interrupt, TrapFrame},
-};
+use {kernel_hal_bare::arch::ack, trapframe::TrapFrame};
 
 #[export_name = "hal_lapic_addr"]
 pub static LAPIC_ADDR: usize = 0xfee0_0000;
 
 pub fn init() {
-    unsafe {
-        init_interrupt();
-    }
-    x86_64::instructions::interrupts::enable();
+    //    x86_64::instructions::interrupts::enable();
 }
 
 // Reference: https://wiki.osdev.org/Exceptions
@@ -55,7 +48,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
             let irq = tf.trap_num as u8 - IRQ0;
             ack(irq); // must ack before switching
             match irq {
-                Timer => processor().tick(),
+                Timer => timer(),
                 _ => {
                     warn!("unhandled external IRQ number: {}", irq);
                 }
@@ -76,3 +69,5 @@ fn double_fault(tf: &TrapFrame) {
 fn page_fault(tf: &mut TrapFrame) {
     panic!("\nEXCEPTION: Page Fault\n{:#x?}", tf);
 }
+
+fn timer() {}

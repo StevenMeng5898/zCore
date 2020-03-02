@@ -18,7 +18,7 @@ pub enum ThreadStateKind {
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 pub struct ThreadState {
-    general: GeneralRegs,
+    pub general: GeneralRegs,
 }
 
 impl ThreadState {

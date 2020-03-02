@@ -1,9 +1,5 @@
 use {
-    super::*,
-    crate::object::*,
-    alloc::sync::Arc,
-    core::convert::TryInto,
-    kernel_hal::{serial_write, timer_now},
+    super::*, crate::object::*, alloc::sync::Arc, core::convert::TryInto, kernel_hal::serial_write,
     spin::Mutex,
 };
 
@@ -42,16 +38,15 @@ impl DebugLog {
         })
     }
 
-    pub fn write(&self, flags: u32, data: &str) -> ZxResult<usize> {
+    pub fn write(&self, flags: u32, data: &str, tid: u64, pid: u64) -> ZxResult<usize> {
         let flags = flags | self.flags;
-        DLOG.lock().write(flags, data.as_bytes());
+        DLOG.lock().write(flags, data.as_bytes(), tid, pid);
         serial_write(data);
         serial_write("\n");
         Ok(0)
     }
 }
 
-#[allow(dead_code)]
 struct DlogBuffer {
     buf: [u8; DLOG_SIZE],
     head: usize,
@@ -68,7 +63,7 @@ impl DlogBuffer {
     }
 
     #[allow(unsafe_code)]
-    pub fn write(&mut self, flags: u32, data: &[u8]) {
+    pub fn write(&mut self, flags: u32, data: &[u8], tid: u64, pid: u64) {
         let wire_size = DLOG_MIN_RECORD + ((data.len() + 3) & !3);
         let header_flag = (((DLOG_MIN_RECORD + data.len()) as u32 & 0xFFFu32) << 12)
             | (wire_size as u32 & 0xFFFu32);
@@ -76,9 +71,9 @@ impl DlogBuffer {
             header: header_flag,
             datalen: data.len() as u16,
             flags: flags as u16,
-            timestamp: timer_now().as_nanos() as u64,
-            pid: 0u64,
-            tid: 0u64,
+            timestamp: 0u64, // FIXME timer_now() should be used here
+            pid,
+            tid,
         };
         let serde_header: [u8; core::mem::size_of::<DlogHeader>()] =
             unsafe { core::mem::transmute(header) };
@@ -145,12 +140,12 @@ mod tests {
     #[test]
     fn buffer_cover1() {
         let mut buffer = DlogBuffer::new();
-        buffer.write(0u32, &[127u8; 100]);
+        buffer.write(0u32, &[127u8; 100], 0, 0);
         let head = buffer.get_head();
         assert_eq!(head, 132usize);
         let tail = buffer.get_tail();
         assert_eq!(tail, 0usize);
-        buffer.write(0u32, &[255u8; 2000]);
+        buffer.write(0u32, &[255u8; 2000], 0, 0);
         let head = buffer.get_head();
         assert_eq!(head, 116usize);
         let tail = buffer.get_tail();
@@ -160,7 +155,7 @@ mod tests {
     #[test]
     fn buffer_cover2() {
         let mut buffer = DlogBuffer::new();
-        buffer.write(0u32, &[127u8; 2000]);
+        buffer.write(0u32, &[127u8; 2000], 0, 0);
         for i in 32..2032 {
             assert!(buffer.check(i, 127u8));
         }
@@ -168,7 +163,7 @@ mod tests {
         assert_eq!(head, 2032usize);
         let tail = buffer.get_tail();
         assert_eq!(tail, 0usize);
-        buffer.write(0u32, &[255u8; 101]);
+        buffer.write(0u32, &[255u8; 101], 0, 0);
         for i in 16..117 {
             assert!(buffer.check(i, 255u8));
         }
@@ -184,8 +179,8 @@ mod tests {
     #[test]
     fn buffer_cover3() {
         let mut buffer = DlogBuffer::new();
-        buffer.write(0u32, &[127u8; 1984]);
-        buffer.write(0xdead_beafu32, &[255u8; 101]);
+        buffer.write(0u32, &[127u8; 1984], 0, 0);
+        buffer.write(0xdead_beafu32, &[255u8; 101], 0, 0);
         for i in 0..101 {
             assert!(buffer.check(i, 255u8));
         }

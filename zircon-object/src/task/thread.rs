@@ -1,12 +1,18 @@
 use {
-    self::thread_state::*,
     super::process::Process,
     super::*,
     crate::object::*,
-    alloc::{boxed::Box, string::String, sync::Arc},
-    core::any::Any,
+    alloc::{boxed::Box, sync::Arc},
+    core::{
+        any::Any,
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    },
     spin::Mutex,
 };
+
+pub use self::thread_state::*;
 
 mod thread_state;
 
@@ -76,14 +82,32 @@ mod thread_state;
 /// [`THREAD_RUNNING`]: crate::object::Signal::THREAD_RUNNING
 pub struct Thread {
     base: KObjectBase,
-    #[allow(dead_code)]
-    name: String,
     proc: Arc<Process>,
     ext: Box<dyn Any + Send + Sync>,
     inner: Mutex<ThreadInner>,
 }
 
 impl_kobject!(Thread);
+
+#[no_mangle]
+extern "C" fn thread_check_runnable(
+    thread: &'static Arc<Thread>,
+) -> Pin<Box<dyn Future<Output = ()>>> {
+    Box::pin(check_runnable_async(thread))
+}
+/// Check whether a thread is runnable
+async fn check_runnable_async(thread: &Arc<Thread>) {
+    thread.check_runnable().await
+}
+
+#[export_name = "thread_set_state"]
+pub fn thread_set_state(thread: &'static Arc<Thread>, state: &'static mut ThreadState) {
+    let mut inner = thread.inner.lock();
+    if let Some(old_state) = inner.state.take() {
+        state.general = old_state.general;
+    }
+    inner.state = Some(state);
+}
 
 #[derive(Default)]
 struct ThreadInner {
@@ -95,7 +119,10 @@ struct ThreadInner {
     /// Thread state
     ///
     /// Only be `Some` on suspended.
-    state: Option<ThreadState>,
+    state: Option<&'static mut ThreadState>,
+
+    suspend_count: usize,
+    waker: Option<Waker>,
 }
 
 impl Thread {
@@ -112,8 +139,11 @@ impl Thread {
     ) -> ZxResult<Arc<Self>> {
         // TODO: options
         let thread = Arc::new(Thread {
-            base: KObjectBase::new(),
-            name: String::from(name),
+            base: {
+                let base = KObjectBase::new();
+                base.set_name(name);
+                base
+            },
             proc: proc.clone(),
             ext: Box::new(ext),
             inner: Mutex::new(ThreadInner::default()),
@@ -150,7 +180,8 @@ impl Thread {
         if inner.hal_thread.is_some() {
             return Err(ZxError::BAD_STATE);
         }
-        let hal_thread = kernel_hal::Thread::spawn(self.clone(), regs);
+        let hal_thread =
+            kernel_hal::Thread::spawn(self.clone(), regs, self.proc.vmar().table_phys());
         inner.hal_thread = Some(hal_thread);
         self.base.signal_set(Signal::THREAD_RUNNING);
         Ok(())
@@ -171,12 +202,67 @@ impl Thread {
         Ok(len)
     }
 
+    #[allow(unsafe_code)]
     /// Write one aspect of thread state.
     pub fn write_state(&self, kind: ThreadStateKind, buf: &[u8]) -> ZxResult<()> {
         let mut inner = self.inner.lock();
-        let state = inner.state.as_mut().ok_or(ZxError::BAD_STATE)?;
+        //let state = inner.state.as_mut().ok_or(ZxError::BAD_STATE)?;
+        let state = inner.state.get_or_insert({
+            unsafe {
+                static mut STATE: ThreadState = ThreadState {
+                    general: GeneralRegs::zero(),
+                };
+                &mut STATE
+            }
+        });
         state.write(kind, buf)?;
         Ok(())
+    }
+
+    pub fn suspend(&self) {
+        let mut inner = self.inner.lock();
+        inner.suspend_count += 1;
+        self.base.signal_set(Signal::THREAD_SUSPENDED);
+        info!(
+            "thread {} suspend_count {}",
+            self.base.get_name(),
+            inner.suspend_count
+        );
+    }
+
+    pub fn check_runnable(self: &Arc<Thread>) -> impl Future<Output = ()> {
+        struct RunnableChecker {
+            thread: Arc<Thread>,
+        }
+        impl Future for RunnableChecker {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+                let count = self.thread.inner.lock().suspend_count;
+                if count == 0 {
+                    Poll::Ready(())
+                } else {
+                    // 把waker存起来，比如self.thread.get_waker
+                    let mut inner = self.thread.inner.lock();
+                    inner.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }
+        RunnableChecker {
+            thread: self.clone(),
+        }
+    }
+
+    pub fn resume(&self) {
+        let mut inner = self.inner.lock();
+        assert_ne!(inner.suspend_count, 0);
+        inner.suspend_count -= 1;
+        if inner.suspend_count == 0 {
+            if let Some(waker) = inner.waker.take() {
+                waker.wake();
+            }
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use {
     super::{job::Job, job_policy::*, resource::*, thread::Thread, *},
     crate::{object::*, vm::*},
-    alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec},
+    alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec},
     core::any::Any,
     spin::Mutex,
 };
@@ -48,7 +48,6 @@ use {
 #[allow(dead_code)]
 pub struct Process {
     base: KObjectBase,
-    name: String,
     job: Arc<Job>,
     policy: JobPolicy,
     vmar: Arc<VmAddressRegion>,
@@ -98,8 +97,11 @@ impl Process {
     ) -> ZxResult<Arc<Self>> {
         // TODO: _options -> options
         let proc = Arc::new(Process {
-            base: KObjectBase::new(),
-            name: String::from(name),
+            base: {
+                let kobject = KObjectBase::new();
+                kobject.set_name(name);
+                kobject
+            },
             job: job.clone(),
             policy: job.policy(),
             vmar: VmAddressRegion::new_root(),
@@ -125,15 +127,18 @@ impl Process {
         arg1: Handle,
         arg2: usize,
     ) -> ZxResult<()> {
-        let mut inner = self.inner.lock();
-        if !inner.contains_thread(thread) {
-            return Err(ZxError::ACCESS_DENIED);
+        let handle_value;
+        {
+            let mut inner = self.inner.lock();
+            if !inner.contains_thread(thread) {
+                return Err(ZxError::ACCESS_DENIED);
+            }
+            handle_value = inner.add_handle(arg1);
+            if inner.status != Status::Init {
+                return Err(ZxError::BAD_STATE);
+            }
+            inner.status = Status::Running;
         }
-        let handle_value = inner.add_handle(arg1);
-        if inner.status != Status::Init {
-            return Err(ZxError::BAD_STATE);
-        }
-        inner.status = Status::Running;
         thread.start(entry, stack, handle_value as usize, arg2)?;
         Ok(())
     }
@@ -185,9 +190,9 @@ impl Process {
     }
 
     /// Remove a handle from the process
-    pub fn remove_handle(&self, handle_value: HandleValue) -> ZxResult<()> {
+    pub fn remove_handle(&self, handle_value: HandleValue) -> ZxResult<Handle> {
         match self.inner.lock().handles.remove(&handle_value) {
-            Some(_) => Ok(()),
+            Some(handle) => Ok(handle),
             None => Err(ZxError::BAD_HANDLE),
         }
     }
@@ -208,7 +213,11 @@ impl Process {
     /// To duplicate the handle with the same rights use `Rights::SAME_RIGHTS`.
     /// If different rights are desired they must be strictly lesser than of the source handle,
     /// or an `ZxError::ACCESS_DENIED` will be raised.
-    pub fn dup_handle(&self, handle_value: HandleValue, rights: Rights) -> ZxResult<HandleValue> {
+    pub fn dup_handle_operating_rights(
+        &self,
+        handle_value: HandleValue,
+        operation: impl FnOnce(Rights) -> ZxResult<Rights>,
+    ) -> ZxResult<HandleValue> {
         let mut inner = self.inner.lock();
         let mut handle = match inner.handles.get(&handle_value) {
             Some(h) => h.clone(),
@@ -217,13 +226,7 @@ impl Process {
         if !handle.rights.contains(Rights::DUPLICATE) {
             return Err(ZxError::ACCESS_DENIED);
         }
-        if !rights.contains(Rights::SAME_RIGHTS) {
-            // `rights` must be strictly lesser than of the source handle
-            if !(handle.rights.contains(rights) && handle.rights != rights) {
-                return Err(ZxError::INVALID_ARGS);
-            }
-            handle.rights = rights;
-        }
+        handle.rights = operation(handle.rights)?;
         let new_handle_value = inner.add_handle(handle);
         Ok(new_handle_value)
     }
@@ -245,6 +248,32 @@ impl Process {
             return Err(ZxError::ACCESS_DENIED);
         }
         Ok(object)
+    }
+
+    pub fn get_object_and_rights<T: KernelObject>(
+        &self,
+        handle_value: HandleValue,
+    ) -> ZxResult<(Arc<T>, Rights)> {
+        let handle = self.get_handle(handle_value)?;
+        // check type before rights
+        let object = handle
+            .object
+            .downcast_arc::<T>()
+            .map_err(|_| ZxError::WRONG_TYPE)?;
+        Ok((object, handle.rights))
+    }
+
+    pub fn get_dyn_object_with_rights(
+        &self,
+        handle_value: HandleValue,
+        desired_rights: Rights,
+    ) -> ZxResult<Arc<dyn KernelObject>> {
+        let handle = self.get_handle(handle_value)?;
+        // check type before rights
+        if !handle.rights.contains(desired_rights) {
+            return Err(ZxError::ACCESS_DENIED);
+        }
+        Ok(handle.object)
     }
 
     /// Get the kernel object corresponding to this `handle_value`
@@ -290,6 +319,24 @@ impl Process {
         Ok(object)
     }
 
+    pub fn get_vmo_and_rights(
+        &self,
+        handle_value: HandleValue,
+    ) -> ZxResult<(Arc<dyn VMObject>, Rights)> {
+        let handle = self.get_handle(handle_value)?;
+        // check type before rights
+        let object: Arc<dyn VMObject> = handle
+            .object
+            .downcast_arc::<VMObjectPaged>()
+            .map(|obj| obj as Arc<dyn VMObject>)
+            .or_else(|obj| {
+                obj.downcast_arc::<VMObjectPhysical>()
+                    .map(|obj| obj as Arc<dyn VMObject>)
+            })
+            .map_err(|_| ZxError::WRONG_TYPE)?;
+        Ok((object, handle.rights))
+    }
+
     /// Add a thread to the process.
     pub(super) fn add_thread(&self, thread: Arc<Thread>) {
         let mut inner = self.inner.lock();
@@ -311,6 +358,28 @@ impl Process {
             self.exit(0);
         }
     }
+
+    pub fn get_info(&self) -> ProcessInfo {
+        let mut info = ProcessInfo::default();
+        // TODO correct debugger_attached setting
+        info.debugger_attached = false;
+        match self.inner.lock().status {
+            Status::Init => {
+                info.started = false;
+                info.has_exited = false;
+            }
+            Status::Running => {
+                info.started = true;
+                info.has_exited = false;
+            }
+            Status::Exited(ret) => {
+                info.return_code = ret;
+                info.has_exited = true;
+                info.started = false;
+            }
+        }
+        info
+    }
 }
 
 impl ProcessInner {
@@ -329,6 +398,16 @@ impl ProcessInner {
     fn contains_thread(&self, thread: &Arc<Thread>) -> bool {
         self.threads.iter().any(|t| Arc::ptr_eq(t, thread))
     }
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct ProcessInfo {
+    pub return_code: i64,
+    pub started: bool,
+    pub has_exited: bool,
+    pub debugger_attached: bool,
+    pub padding1: [u8; 5],
 }
 
 #[cfg(test)]
@@ -386,33 +465,31 @@ mod tests {
 
         // duplicate non-exist handle should fail.
         assert_eq!(
-            proc.dup_handle(0, Rights::empty()),
+            proc.dup_handle_operating_rights(0, |_| Ok(Rights::empty())),
             Err(ZxError::BAD_HANDLE)
         );
 
         // duplicate handle with the same rights.
         let rights = Rights::DUPLICATE;
         let handle_value = proc.add_handle(Handle::new(proc.clone(), rights));
-        let new_handle_value = proc.dup_handle(handle_value, Rights::SAME_RIGHTS).unwrap();
+        let new_handle_value = proc
+            .dup_handle_operating_rights(handle_value, |old_rights| Ok(old_rights))
+            .unwrap();
         assert_eq!(proc.get_handle(new_handle_value).unwrap().rights, rights);
 
         // duplicate handle with subset rights.
-        let new_handle_value = proc.dup_handle(handle_value, Rights::empty()).unwrap();
+        let new_handle_value = proc
+            .dup_handle_operating_rights(handle_value, |_| Ok(Rights::empty()))
+            .unwrap();
         assert_eq!(
             proc.get_handle(new_handle_value).unwrap().rights,
             Rights::empty()
         );
 
-        // duplicate handle with more rights should fail.
-        assert_eq!(
-            proc.dup_handle(handle_value, Rights::READ),
-            Err(ZxError::INVALID_ARGS)
-        );
-
         // duplicate handle which does not have `Rights::DUPLICATE` should fail.
         let handle_value = proc.add_handle(Handle::new(proc.clone(), Rights::empty()));
         assert_eq!(
-            proc.dup_handle(handle_value, Rights::SAME_RIGHTS),
+            proc.dup_handle_operating_rights(handle_value, |_| Ok(Rights::SAME_RIGHTS)),
             Err(ZxError::ACCESS_DENIED)
         );
     }

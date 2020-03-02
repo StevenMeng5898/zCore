@@ -9,6 +9,7 @@
 //! ## Example
 //! ```
 //! use zircon_object::object::*;
+//! extern crate alloc;
 //!
 //! pub struct SampleObject {
 //!    base: KObjectBase,
@@ -95,7 +96,7 @@
 
 use {
     crate::signal::*,
-    alloc::{boxed::Box, sync::Arc, vec::Vec},
+    alloc::{boxed::Box, string::String, sync::Arc, vec::Vec},
     core::{
         fmt::Debug,
         future::Future,
@@ -121,6 +122,8 @@ mod signal;
 pub trait KernelObject: DowncastSync + Debug {
     fn id(&self) -> KoID;
     fn type_name(&self) -> &'static str;
+    fn name(&self) -> alloc::string::String;
+    fn set_name(&self, name: &str);
     fn signal(&self) -> Signal;
     fn signal_set(&self, signal: Signal);
     fn add_signal_callback(&self, callback: SignalHandler);
@@ -138,10 +141,26 @@ pub struct KObjectBase {
 }
 
 /// The mutable part of `KObjectBase`.
-#[derive(Default)]
 struct KObjectBaseInner {
+    name: String,
     signal: Signal,
     signal_callbacks: Vec<SignalHandler>,
+}
+
+impl Default for KObjectBaseInner {
+    fn default() -> Self {
+        KObjectBaseInner {
+            name: {
+                let mut s = String::with_capacity(32);
+                for _ in 0..32 {
+                    s.push('\0');
+                }
+                s
+            },
+            signal: Signal::default(),
+            signal_callbacks: Vec::default(),
+        }
+    }
 }
 
 impl Default for KObjectBase {
@@ -159,11 +178,25 @@ impl KObjectBase {
         Self::default()
     }
 
+    /// Set object's name
+    pub fn set_name(&self, name: &str) {
+        let s = &mut self.inner.lock().name;
+        s.clear();
+        assert!(name.len() <= 32, "name is too long for object");
+        s.push_str(name);
+    }
+
+    /// Get object's name
+    pub fn get_name(&self) -> String {
+        String::from(self.inner.lock().name.as_str())
+    }
+
     /// Create a kernel object base with initial `signal`.
     pub fn with_signal(signal: Signal) -> Self {
         KObjectBase {
             id: Self::new_koid(),
             inner: Mutex::new(KObjectBaseInner {
+                name: String::default(),
                 signal,
                 signal_callbacks: Vec::new(),
             }),
@@ -353,6 +386,12 @@ macro_rules! impl_kobject {
             fn type_name(&self) -> &'static str {
                 stringify!($class)
             }
+            fn name(&self) -> alloc::string::String{
+                self.base.get_name()
+            }
+            fn set_name(&self, name: &str){
+                self.base.set_name(name)
+            }
             fn signal(&self) -> Signal {
                 self.base.signal()
             }
@@ -415,7 +454,7 @@ mod tests {
             async move {
                 flag.store(1, Ordering::SeqCst);
                 object.base.signal_set(Signal::READABLE);
-                async_std::task::sleep(Duration::from_millis(1)).await;
+                async_std::task::sleep(Duration::from_millis(10)).await;
 
                 flag.store(2, Ordering::SeqCst);
                 object.base.signal_set(Signal::WRITABLE);
