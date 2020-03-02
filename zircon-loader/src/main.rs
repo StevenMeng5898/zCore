@@ -51,6 +51,7 @@ mod tests {
 
     #[async_std::test]
     async fn userboot() {
+        env_logger::init();
         kernel_hal_unix::init();
 
         let base = PathBuf::from("../prebuilt");
@@ -58,7 +59,7 @@ mod tests {
             decompressor_path: base.join("zircon/decompress-zstd.so"),
             userboot_path: base.join("userboot.so"),
             vdso_path: base.join("libzircon.so"),
-            zbi_path: base.join("legacy-image-x64.zbi"),
+            zbi_path: base.join("zircon/fuchsia.zbi"),
             cmdline: String::from(""),
         };
         let userboot_data = std::fs::read(opt.userboot_path).expect("failed to read file");

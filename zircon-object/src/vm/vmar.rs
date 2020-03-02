@@ -46,14 +46,24 @@ impl VmAddressRegion {
     /// Create a new root VMAR.
     pub fn new_root() -> Arc<Self> {
         // FIXME: workaround for unix
+        //  On current implementation of HAL-Unix, all processes share a single address space.
+        //  So we have to allocate exclusive address space for each VMAR.
+        //  Zircon programs have another strange restriction:
+        //      (vmar.base + vmar.len) / 2 > vmar.base
+        //   =>  vmar.base < vmar.len
+        //  So now we use an exponential address allocation.
         static VMAR_ID: AtomicUsize = AtomicUsize::new(0);
         let i = VMAR_ID.fetch_add(1, Ordering::SeqCst);
-        let addr: usize = 0x2_00000000 + 0x10_00000000 * i;
+        #[cfg(not(test))]
+        let (addr, size) = (0x2_00000000 << (2 * i), (0x2_00000000 << (2 * i)) * 3);
+        #[cfg(test)]
+        let (addr, size) = (0x2_00000000 * (i + 1), 0x2_00000000);
+
         Arc::new(VmAddressRegion {
             flags: VmarFlags::ROOT_FLAGS,
             base: KObjectBase::new(),
             addr,
-            size: 0x10_00000000,
+            size,
             parent: None,
             page_table: Arc::new(Mutex::new(kernel_hal::PageTable::new())),
             inner: Mutex::new(Some(VmarInner::default())),
